@@ -4,7 +4,8 @@ name: Deploy Worker
 on:
   push:
     branches: [main]
-    paths:      - worker.js
+    paths:
+      - worker.js
       - wrangler.toml
       - .github/workflows/deploy.yml
   workflow_dispatch:
@@ -20,4 +21,3 @@ jobs:
           accountId: 729643c063c7393e62341390394c43e7
           command: deploy
 # end
-  
