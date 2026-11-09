@@ -1,4 +1,5 @@
-export default {  async fetch(request) {
+export default {
+  async fetch(request) {
     const url = new URL(request.url);
     const data = {
       service: "muse-free-stack-test",
@@ -16,4 +17,5 @@ export default {  async fetch(request) {
       return Response.json({ pong: true, at: new Date().toISOString() });
     }
     return Response.json(data, { headers: { "content-type": "application/json; charset=utf-8" } });
-  },};
+  },
+};
