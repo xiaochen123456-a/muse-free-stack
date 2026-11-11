@@ -246,7 +246,7 @@ async function mcpSession(method, params) {
       })
       .catch(() => clearTimeout(timer));
   } catch {}
-  const res = await mcpPost({ jsonrpc: "2.0", id: 2, method, params }, sessionId);
+  const res = await mcpPost({ jsonrpc: "2.0", id: 2, method, params }, sessionId, 120000);
   if (!res.data || res.data.error || !res.data.result) {
     return { ok: false, stage: method, detail: res };
   }
@@ -339,7 +339,21 @@ async function handleParallel(url) {
         return parallelBad("questions must be a JSON object string");
       }
     } else if (single) {
-      questions = { answer: { type: "boolean", question: single } };
+      // choice 型：type 只能是 choice/score/noul，没有 boolean；choice 必须带
+      // instructions（字符串）和 criteria（字典，按选项分条）。这是 2026-11-11
+      // 实测时服务端报错一步步逼出来的形状。
+      questions = {
+        answer: {
+          type: "choice",
+          question: single,
+          options: ["Yes", "No"],
+          instructions: "Answer based on current web evidence.",
+          criteria: {
+            Yes: "The statement is true according to current web evidence.",
+            No: "The statement is false according to current web evidence.",
+          },
+        },
+      };
     }
     if (!questions || typeof questions !== "object") return parallelBad("missing questions");
     const stateRaw = (url.searchParams.get("state") || "").trim();
