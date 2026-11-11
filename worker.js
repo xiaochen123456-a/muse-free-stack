@@ -279,32 +279,79 @@ async function handleParallel(url) {
   if (tool === "web_search") {
     const q = (url.searchParams.get("q") || "").trim();
     if (!q) return parallelBad("missing q");
-    const r = await mcpSession("tools/call", { name: "web_search", arguments: { query: q } });
+    let queries = [q];
+    const rawQ = (url.searchParams.get("queries") || "").trim();
+    if (rawQ) {
+      try {
+        queries = JSON.parse(rawQ);
+      } catch {
+        return parallelBad("queries must be a JSON array string");
+      }
+    }
+    if (!Array.isArray(queries) || queries.length === 0) return parallelBad("queries must be a non-empty array");
+    const r = await mcpSession("tools/call", { name: "web_search", arguments: { objective: q, search_queries: queries } });
     if (!r.ok) return done(r);
     return done({ ok: true, tool: "web_search", content: r.result.content || [], isError: !!r.result.isError });
   }
   if (tool === "web_fetch") {
     const u = (url.searchParams.get("url") || "").trim();
-    if (!u) return parallelBad("missing url");
-    const r = await mcpSession("tools/call", { name: "web_fetch", arguments: { url: u } });
+    const rawU = (url.searchParams.get("urls") || "").trim();
+    let urls = [];
+    if (rawU) {
+      try {
+        urls = JSON.parse(rawU);
+      } catch {
+        return parallelBad("urls must be a JSON array string");
+      }
+    } else if (u) {
+      urls = [u];
+    }
+    if (!Array.isArray(urls) || urls.length === 0) return parallelBad("missing url");
+    const objective = (url.searchParams.get("objective") || "").trim();
+    const args = { urls };
+    if (objective) args.objective = objective.slice(0, 200);
+    const r = await mcpSession("tools/call", { name: "web_fetch", arguments: args });
     if (!r.ok) return done(r);
     return done({ ok: true, tool: "web_fetch", content: r.result.content || [], isError: !!r.result.isError });
   }
   if (tool === "web_decisions") {
+    // 优先用 args 直通（完整 arguments JSON，形状以 tools/list 的 inputSchema 为准）；
+    // 否则用 question 快捷方式拼一个布尔型问题（形状是按 schema 猜的，失败时看服务端报错再调）。
+    const rawArgs = (url.searchParams.get("args") || "").trim();
+    if (rawArgs) {
+      let args;
+      try {
+        args = JSON.parse(rawArgs);
+      } catch {
+        return parallelBad("args must be a JSON object string");
+      }
+      const r = await mcpSession("tools/call", { name: "web_decisions", arguments: args });
+      if (!r.ok) return done(r);
+      return done({ ok: true, tool: "web_decisions", content: r.result.content || [], isError: !!r.result.isError });
+    }
     const raw = (url.searchParams.get("questions") || "").trim();
     const single = (url.searchParams.get("question") || "").trim();
-    let questions = [];
+    let questions = null;
     if (raw) {
       try {
         questions = JSON.parse(raw);
       } catch {
-        return parallelBad("questions must be a JSON array string");
+        return parallelBad("questions must be a JSON object string");
       }
     } else if (single) {
-      questions = [single];
+      questions = { answer: { type: "boolean", question: single } };
     }
-    if (!Array.isArray(questions) || questions.length === 0) return parallelBad("missing questions");
-    const r = await mcpSession("tools/call", { name: "web_decisions", arguments: { questions } });
+    if (!questions || typeof questions !== "object") return parallelBad("missing questions");
+    const stateRaw = (url.searchParams.get("state") || "").trim();
+    let state = { subject: single || "general" };
+    if (stateRaw) {
+      try {
+        state = JSON.parse(stateRaw);
+      } catch {
+        return parallelBad("state must be a JSON value string");
+      }
+    }
+    const r = await mcpSession("tools/call", { name: "web_decisions", arguments: { state, questions } });
     if (!r.ok) return done(r);
     return done({ ok: true, tool: "web_decisions", content: r.result.content || [], isError: !!r.result.isError });
   }
