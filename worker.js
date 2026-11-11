@@ -119,11 +119,206 @@ const ROOT = {
   links: { count: LINKS.length, search_page: "/links", api: "/api/links?q=关键词&category=🟢 赚钱&status=pending" },
 };
 
+// ---- Parallel MCP 匿名中继（GET 接口）----
+// 背景：云端这台机器出口只通 GET、所有 POST 都被挡（httpbin 对照也一样）；
+// MCP 协议必须走 POST，所以直连测不了。这条路由让 Worker（Cloudflare 出口正常）
+// 代做 MCP 握手 + 工具调用，云端只用 GET 就能查。
+// GET /api/parallel?tool=list
+// GET /api/parallel?tool=web_search&q=...
+// GET /api/parallel?tool=web_fetch&url=...
+// GET /api/parallel?tool=web_decisions&question=... 或 questions=["...","..."]
+// 不传任何 Key、不登录、不绑卡，只用 Parallel 的匿名免费额度；超了只限速、不扣费。
+// 注意：这条路由是公开 URL（没做鉴权，Key 放公开仓里等于没放），只代理免费匿名 MCP，
+// 不经过任何账号或付费额度；有人乱刷最多烧匿名限速和本 Worker 的免费次数。
+const MCP_URL = "https://mcp.parallel.ai/mcp";
+
+// 调一次 MCP JSON-RPC（Streamable HTTP）。服务器会一直开着 SSE 流，必须读到目标 id 的
+// result/error 就主动断开，不能等流关（等流关会一直挂着）。
+async function mcpPost(payload, sessionId, timeoutMs = 25000) {
+  const headers = {
+    "content-type": "application/json",
+    "accept": "application/json, text/event-stream",
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let resp;
+  try {
+    resp = await fetch(MCP_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    return { error: "fetch failed: " + (e && e.message ? e.message : String(e)) };
+  }
+  const newSession = resp.headers.get("mcp-session-id") || sessionId || null;
+  const ctype = (resp.headers.get("content-type") || "").toLowerCase();
+  if (ctype.includes("application/json") && !ctype.includes("text/event-stream")) {
+    clearTimeout(timer);
+    try {
+      const data = await resp.json();
+      return { data, sessionId: newSession, httpStatus: resp.status };
+    } catch (e) {
+      return { error: "bad json response: " + e.message, sessionId: newSession, httpStatus: resp.status };
+    }
+  }
+  if (!resp.body) {
+    clearTimeout(timer);
+    return { error: "empty response body", sessionId: newSession, httpStatus: resp.status };
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const raw = t.slice(5).trim();
+        if (!raw || raw === "[DONE]") continue;
+        let msg;
+        try {
+          msg = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        if (msg && msg.id === payload.id && (msg.result !== undefined || msg.error !== undefined)) {
+          try {
+            await reader.cancel();
+          } catch {}
+          clearTimeout(timer);
+          return { data: msg, sessionId: newSession, httpStatus: resp.status };
+        }
+      }
+    }
+  } catch (e) {
+    clearTimeout(timer);
+    return { error: "stream read failed: " + (e && e.message ? e.message : String(e)), sessionId: newSession, httpStatus: resp.status };
+  }
+  clearTimeout(timer);
+  return { error: "no matching response in stream", sessionId: newSession, httpStatus: resp.status };
+}
+
+// 做一次完整 MCP 会话：initialize → notifications/initialized → 目标方法。
+// Worker 无状态，每次调用重新握手（初始化约 0.8 秒，搜索约 1.7 秒）。
+async function mcpSession(method, params) {
+  const init = await mcpPost({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "parallel-mcp-relay", version: "1.0" },
+    },
+  });
+  if (!init.data || init.data.error || !init.data.result) {
+    return { ok: false, stage: "initialize", detail: init };
+  }
+  const sessionId = init.sessionId || null;
+  // initialized 通知：发了就走，不等流（通知本身不回包，等会挂住），3 秒兜底
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3000);
+    await fetch(MCP_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+        ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      signal: ctrl.signal,
+    })
+      .then((r) => {
+        clearTimeout(timer);
+        try {
+          if (r.body) r.body.cancel();
+        } catch {}
+      })
+      .catch(() => clearTimeout(timer));
+  } catch {}
+  const res = await mcpPost({ jsonrpc: "2.0", id: 2, method, params }, sessionId);
+  if (!res.data || res.data.error || !res.data.result) {
+    return { ok: false, stage: method, detail: res };
+  }
+  return { ok: true, result: res.data.result };
+}
+
+function parallelBad(message) {
+  return Response.json(
+    { ok: false, error: message },
+    { status: 400, headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" } },
+  );
+}
+
+async function handleParallel(url) {
+  const tool = (url.searchParams.get("tool") || "web_search").trim();
+  const started = Date.now();
+  const done = (result) =>
+    Response.json(
+      { ...result, ms: Date.now() - started, via: "parallel-mcp-relay (anonymous, no key)" },
+      { headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" } },
+    );
+  if (tool === "list") {
+    const r = await mcpSession("tools/list", {});
+    if (!r.ok) return done(r);
+    return done({
+      ok: true,
+      tools: (r.result.tools || []).map((t) => ({ name: t.name, description: t.description || "", inputSchema: t.inputSchema || {} })),
+    });
+  }
+  if (tool === "web_search") {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (!q) return parallelBad("missing q");
+    const r = await mcpSession("tools/call", { name: "web_search", arguments: { query: q } });
+    if (!r.ok) return done(r);
+    return done({ ok: true, tool: "web_search", content: r.result.content || [], isError: !!r.result.isError });
+  }
+  if (tool === "web_fetch") {
+    const u = (url.searchParams.get("url") || "").trim();
+    if (!u) return parallelBad("missing url");
+    const r = await mcpSession("tools/call", { name: "web_fetch", arguments: { url: u } });
+    if (!r.ok) return done(r);
+    return done({ ok: true, tool: "web_fetch", content: r.result.content || [], isError: !!r.result.isError });
+  }
+  if (tool === "web_decisions") {
+    const raw = (url.searchParams.get("questions") || "").trim();
+    const single = (url.searchParams.get("question") || "").trim();
+    let questions = [];
+    if (raw) {
+      try {
+        questions = JSON.parse(raw);
+      } catch {
+        return parallelBad("questions must be a JSON array string");
+      }
+    } else if (single) {
+      questions = [single];
+    }
+    if (!Array.isArray(questions) || questions.length === 0) return parallelBad("missing questions");
+    const r = await mcpSession("tools/call", { name: "web_decisions", arguments: { questions } });
+    if (!r.ok) return done(r);
+    return done({ ok: true, tool: "web_decisions", content: r.result.content || [], isError: !!r.result.isError });
+  }
+  return parallelBad("unknown tool: " + tool + " (use list, web_search, web_fetch, web_decisions)");
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/api/ping") {
       return Response.json({ pong: true, at: new Date().toISOString() });
+    }
+    if (url.pathname === "/api/parallel") {
+      return handleParallel(url);
     }
     if (url.pathname === "/api/links") {
       return Response.json(searchLinks(url), {
